@@ -15,13 +15,17 @@ use std::fs;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use flate2::read::ZlibDecoder;
+// add BigEndian
+use byteorder::BigEndian;
+use byteorder::ByteOrder;
 
 
 fn main() -> std::io::Result<()> {
-    write_index(vec!["first.txt", "second.txt"])?;
+    write_tree()?;
 
     Ok(())
 }
+
 
 fn create_entry(filename: &str) -> std::io::Result<Vec<u8>> {
     // create PathBuf struct from path name
@@ -103,6 +107,75 @@ fn write_index(filenames: Vec<&str>) -> std::io::Result<()> {
 
     Ok(())
 }
+
+// function to create tree
+fn write_tree() -> std::io::Result<()> {
+    // read index as bytes
+    let mut path = env::current_dir()?;
+    path.push(PathBuf::from(".git/index"));
+    let mut file = File::open(path)?;
+    let mut buf: Vec<u8> = Vec::new();
+    file.read_to_end(&mut buf)?;
+
+    let entry_num = BigEndian::read_u32(&buf[8..12]) as usize;
+    let mut start_size = 12 as usize;
+
+    let mut entries: Vec<Vec<u8>> = vec![]; 
+
+    for _ in 0..entry_num {
+        // mode: 24 ~ 27
+        let mode = BigEndian::read_u32(&buf[(start_size+24)..(start_size+28)]) as u32;
+        // hash: 40 ~ 60
+        let hash = (&buf[(start_size+40)..(start_size+60)]).to_vec();
+        // filename size: 60 ~ 61
+        let filename_size = BigEndian::read_u16(&buf[(start_size+60)..(start_size+62)]) as u16;
+        // filename: 62 ~ ?
+        let filename = (&buf[(start_size+62)..(start_size+62+filename_size as usize)]).to_vec();
+
+        let padding_size = padding(filename_size as usize);
+        start_size = start_size + 62 + filename_size as usize + padding_size;
+
+        let entry_header = format!("{:0>6o} {}\0", mode, String::from_utf8(filename).ok().unwrap());
+        let entry = [entry_header.as_bytes(), &hash].concat();
+
+        entries.push(entry);
+    }
+
+    // make entry together, and concat them with tree header
+    let content = entries.concat();
+    let header = format!("tree {}\0", content.len());
+    let tree_content = [header.as_bytes().to_vec()].concat();
+
+    // buffer for compress
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&tree_content)?;
+    let compressed = encoder.finish()?;
+
+    // calculate hash
+    let tree_hash = Sha1::digest(&tree_content);
+    println!("tree hash: {:x}", tree_hash);
+    let hash = format!("{:x}", tree_hash);
+    let (dir, file) = hash.split_at(2);
+
+    let mut current_path = env::current_dir()?;
+    current_path.push(".git/objects");
+    current_path.push(dir);
+
+    let object_dir = current_path.clone();
+
+    fs::create_dir_all(object_dir)?;
+
+    current_path.push(file);
+    let object_path = current_path;
+
+    // add contents
+    let mut f = File::create(object_path)?;
+    f.write_all(&compressed)?;
+    f.flush()?;
+
+    Ok(())
+}
+
 
 fn cat_blob(hash: &str) -> std::io::Result<()> {
     // up to 2 characters of hash: directory path, 38 characters: file path

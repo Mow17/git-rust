@@ -18,14 +18,21 @@ use flate2::read::ZlibDecoder;
 // add BigEndian
 use byteorder::BigEndian;
 use byteorder::ByteOrder;
+// add Utc
+use chrono::Utc;
 
 
 fn main() -> std::io::Result<()> {
-    ls_files()?;
+    let args: Vec<String> = env::args().collect();
+    let message = &args[1];
+
+    let tree_hash = write_tree()?;
+    let commit_hash= commit_tree(&tree_hash, message)?;
+
+    println!("{:?}", commit_hash);
 
     Ok(())
 }
-
 
 fn create_entry(filename: &str) -> std::io::Result<Vec<u8>> {
     // create PathBuf struct from path name
@@ -109,7 +116,7 @@ fn write_index(filenames: Vec<&str>) -> std::io::Result<()> {
 }
 
 // function to create tree
-fn write_tree() -> std::io::Result<()> {
+fn write_tree() -> std::io::Result<String> {
     // read index as bytes
     let mut path = env::current_dir()?;
     path.push(PathBuf::from(".git/index"));
@@ -173,9 +180,8 @@ fn write_tree() -> std::io::Result<()> {
     f.write_all(&compressed)?;
     f.flush()?;
 
-    Ok(())
+    Ok(hash)
 }
-
 
 fn cat_blob(hash: &str) -> std::io::Result<()> {
     // up to 2 characters of hash: directory path, 38 characters: file path
@@ -333,4 +339,139 @@ fn ls_files() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+// When reading HEAD, only the very first commit is not hashed, so leave the return value as Option<String>> type.
+fn read_head() -> std::io::Result<Option<String>> {
+    // HEAD struct is "refs: <branch-path> or <hash>"
+    let mut path = env::current_dir()?;
+    path.push(PathBuf::from(".git/HEAD"));
+    let mut file = File::open(path)?;
+    let mut reference = String::new();
+    file.read_to_string(&mut reference)?;
+
+    let prefix_path = reference.split(" ").collect::<Vec<&str>>();
+
+    // If HEAD contains a branch name, the hash value of the branch content will be the hash value that HEAD points to.
+    if prefix_path[1].contains("/") {
+        // branch path is ".git/refs/heads/<branch-name>"
+        let mut branch_path = env::current_dir()?;
+        branch_path.push(PathBuf::from(".git"));
+        // Replace because it contains line breaks
+        branch_path.push(PathBuf::from(prefix_path[1].replace("\n", "")));
+        println!("{:?}", prefix_path[1]);
+
+        match File::open(branch_path) {
+            Ok(mut f) => {
+                let mut hash = String::new();
+                f.read_to_string(&mut hash)?;
+                // Replace because it contains line breaks
+                return Ok(Some(hash.replace("\n", "")));
+            },
+            Err(_) => {
+                return Ok(None);
+            }
+        }
+    }
+    // if the hash value was stored directly
+    Ok(Some(prefix_path[1].replace("\n", "").to_owned()))
+}
+
+fn commit_tree(tree_hash: &str, message: &str) -> std::io::Result<Option<String>> {
+    let tree_hash = format!("tree {}", tree_hash);
+
+    let author = format!("author {} <{}> {} +0900", 
+        "Mow17",
+        "Mow17@test.com",
+        Utc::now().timestamp()
+    );
+    let commiter = format!("commiter {} <{}> {} +0900", 
+        "Mow17",
+        "Mow17@test.com",
+        Utc::now().timestamp()
+    );
+
+    // The commit in HEAD is the parent commit, so read the hash value of HEAD
+    let commit_content = match read_head()? {
+        Some(h) => {
+            let parent = format!("parent {}", h);
+            let content = format!("{}\n{}\n{}\n\n{}\n{}\n", 
+                tree_hash, parent, author, commiter, message
+            );
+            format!("commit {}\0{}", content.len(), content).as_bytes().to_vec()
+        },
+        _ => {
+            let content = format!("{}\n{}\n{}\n\n{}\n", 
+                tree_hash, author, commiter, message
+            );
+            format!("commit {}\0{}", content.len(), content).as_bytes().to_vec()
+        }
+    };
+
+    // buffer for compressed
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&commit_content)?;
+    let compressed = encoder.finish()?;
+
+    // calculate hash
+    let commit_hash = Sha1::digest(&commit_content);
+    println!("commit hash: {:x}", commit_hash);
+    // make hash string
+    let hash = format!("{:x}", commit_hash);
+    // up to 2 characters of the hash value is the directory path and 38 characters is the file path
+    let (dir, file) = hash.split_at(2);
+
+    // Use PathBuf to represent all OS paths.
+    let mut current_path = env::current_dir()?;
+    current_path.push(".git/objects");
+    current_path.push(dir);
+
+    let object_dir = current_path.clone();
+
+    // create directory if not exist
+    fs::create_dir_all(object_dir)?;
+
+    current_path.push(file);
+    let objact_path = current_path.clone();
+    let mut f = File::create(objact_path)?;
+    f.write_all(&compressed)?;
+    f.flush()?;
+
+    Ok(Some(hash))
+}
+
+// Read the `tree` hash from the `commit` hash
+fn cat_commit_tree(commit_hash: &str) -> std::io::Result<String> {
+    // up to 2 characters of hash: directory path, and 38 characters: file path
+    let (dir, file) = commit_hash.split_at(2);
+
+    // get path to the object
+    let mut current_path = env::current_dir()?;
+    current_path.push(".git/objects");
+    current_path.push(dir);
+    current_path.push(file);
+    let object_path = current_path.clone();
+
+    // open  object and load it in binary
+    let mut file = File::open(object_path)?;
+    let mut compressed = Vec::new();
+    file.read_to_end(&mut compressed)?;
+
+    // decompress compressed data
+    let mut decoder = ZlibDecoder::new(&compressed[..]);
+    let mut object_content: Vec<u8> = Vec::new();
+    decoder.read_to_end(&mut object_content)?;
+
+    // separate header and content with null bytes
+    let mut contents = object_content.splitn(2, |&x| x == b'\0');
+
+    // retrieves  second word from  first line, splitting it with space, and returns that string
+    let tree = contents.next().and_then(|c| {
+        c.split(|&x| x == b'\n')
+            .filter(|&x| x.is_empty())
+            .map(|x| String::from_utf8_lossy(x).to_string())
+            .find_map(|x| x.split_whitespace().nth(1).map(|x| x.to_string()))
+    });
+
+    Ok(tree.unwrap())
 }

@@ -21,7 +21,7 @@ use byteorder::ByteOrder;
 
 
 fn main() -> std::io::Result<()> {
-    write_tree()?;
+    ls_files()?;
 
     Ok(())
 }
@@ -248,6 +248,89 @@ fn write_blob(filename: &str) -> std::io::Result<()> {
     let mut f = File::create(object_path)?;
     f.write_all(&compressed)?;
     f.flush()?;
+
+    Ok(())
+}
+
+fn update_index(filepath: &str) -> std::io::Result<()> {
+    let mut path = env::current_dir()?; // get current dir
+    path.push(PathBuf::from(".git/index")); // create absolute path
+
+    let buf = match File::open(path.clone()) {
+        Ok(mut f) => {
+            let mut buf: Vec<u8> = vec![];
+            f.read_to_end(&mut buf)?;
+            buf
+        },
+        Err(_) => {
+            vec![]
+        }
+    };
+
+    if buf == vec![] {
+        write_index(vec![filepath])?;
+    } else {
+        // collect file name in index
+        let mut file_paths: Vec<String> = vec![];
+
+        let entry_num = BigEndian::read_u32(&buf[8..12]) as usize;
+        let mut start_size = 12 as usize;
+        for _ in 0..entry_num {
+            // file name size 60 ~ 61
+            let filename_size = BigEndian::read_u16(&buf[start_size+60..start_size+62]) as u16;
+            // file name 62 ~ 62 + filename_size
+            let filename = (&buf[start_size+62..start_size+62+filename_size as usize]).to_vec();
+
+            // calculate padding, and specify next entry bytes
+            let padding_size = padding(filename_size as usize);
+            start_size += 62 + filename_size as usize + padding_size;
+
+            let filename = String::from_utf8(filename).ok().unwrap();
+            file_paths.push(filename);
+        }
+
+        // add new file path if not exist
+        if !file_paths.iter().any(|e| e == &filepath) {
+            file_paths.push(filepath.to_owned());
+        }
+
+        // sort file paths to write index
+        file_paths.sort();
+        // create index with sorted file paths
+        write_index(file_paths.iter().map(|s| &**s).collect())?;
+    }
+    Ok(())
+}
+
+fn ls_files() -> std::io::Result<()> {
+    // read index as bytes
+    let mut path = env::current_dir()?;
+    path.push(PathBuf::from(".git/index"));
+    let mut file = File::open(path)?;
+    let mut buf: Vec<u8> = Vec::new();
+    file.read_to_end(&mut buf)?;
+
+    let entry_num = BigEndian::read_u32(&buf[8..12]) as usize;
+    let mut start_size = 12 as usize;
+
+    for _ in 0..entry_num {
+        // mode: 24 ~ 27
+        let mode = BigEndian::read_u32(&buf[(start_size+24)..(start_size+28)]) as u32;
+        // hash: 40 ~ 60
+        let hash = (&buf[(start_size+40)..(start_size+60)]).to_vec();
+        // filename size: 60 ~ 61
+        let filename_size = BigEndian::read_u16(&buf[(start_size+60)..(start_size+62)]) as u16;
+        // filename: 62 ~ ?
+        let filename = (&buf[(start_size+62)..(start_size+62+filename_size as usize)]).to_vec();
+
+        let padding_size = padding(filename_size as usize);
+        start_size = start_size + 62 + filename_size as usize + padding_size;
+
+        // no option
+        println!("{}", String::from_utf8(filename.clone()).ok().unwrap());
+        // -s option
+        // println!("{:0>6o} {} 0\t{}", mode, hex::encode(hash), String::from_utf8(filename.clone()).ok().unwrap());
+    }
 
     Ok(())
 }

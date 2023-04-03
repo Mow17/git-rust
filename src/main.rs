@@ -20,17 +20,50 @@ use byteorder::BigEndian;
 use byteorder::ByteOrder;
 // add Utc
 use chrono::Utc;
-
+// clap crate
+use clap::{Command, Arg, ArgAction};
 
 fn main() -> std::io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let message = &args[1];
-
-    let tree_hash = write_tree()?;
-    let commit_hash= commit_tree(&tree_hash, message)?;
-
-    println!("{:?}", commit_hash);
-
+    let cmd = Command::new("git-rust")
+        .about("This is Original Git written in Rust")
+        .version("0.1.0")
+        .author("Mow17. <Mow17@test.com>")
+        .arg_required_else_help(true)
+        .allow_external_subcommands(false)
+        .subcommand(Command::new("add")
+            .about("Snaphot latest working directory")
+            .arg(Arg::new("file")
+            .value_parser(clap::builder::NonEmptyStringValueParser::new())
+            .required(false)
+            .value_name("file")))
+        .subcommand(Command::new("commit")
+            .about("Register snapshot(tree object) as commit object in local repository")
+            .arg(Arg::new("message")
+            .short('m')
+            .value_parser(clap::builder::NonEmptyStringValueParser::new())
+            .help("Add message to commit object")
+            .required(true)));
+    
+    match cmd.get_matches().subcommand() {
+        Some(("add", sub_m)) => {
+            let filename: Option<&String> = sub_m.get_one("file");
+            match filename {
+                Some(f) => add(f)?,
+                None => panic!("Required file path"),
+            }
+        },
+        Some(("commit", sub_m)) => {
+            let message: Option<&String> = sub_m.get_one("message");
+            match message {
+                Some(m) => commit(m)?,
+                None => panic!("Required message"),
+            }
+        },
+        _ => {
+            println!("No subcommand was used");
+        },
+    }
+    
     Ok(())
 }
 
@@ -132,7 +165,7 @@ fn write_tree() -> std::io::Result<String> {
     for _ in 0..entry_num {
         // mode: 24 ~ 27
         let mode = BigEndian::read_u32(&buf[(start_size+24)..(start_size+28)]) as u32;
-        // hash: 40 ~ 60
+        // hash: 40 ~ 59
         let hash = (&buf[(start_size+40)..(start_size+60)]).to_vec();
         // filename size: 60 ~ 61
         let filename_size = BigEndian::read_u16(&buf[(start_size+60)..(start_size+62)]) as u16;
@@ -394,11 +427,17 @@ fn commit_tree(tree_hash: &str, message: &str) -> std::io::Result<Option<String>
     // The commit in HEAD is the parent commit, so read the hash value of HEAD
     let commit_content = match read_head()? {
         Some(h) => {
-            let parent = format!("parent {}", h);
-            let content = format!("{}\n{}\n{}\n\n{}\n{}\n", 
-                tree_hash, parent, author, commiter, message
-            );
-            format!("commit {}\0{}", content.len(), content).as_bytes().to_vec()
+            // if it is the same as  `tree` in  previous (HEAD) `commit`, don't commit
+            if tree_hash.as_str() != cat_commit_tree(h.as_str())? {
+                let parent = format!("parent {}", h);
+                let content = format!("{}\n{}\n{}\n\n{}\n{}\n", 
+                    tree_hash, parent, author, commiter, message
+                );
+                format!("commit {}\0{}", content.len(), content).as_bytes().to_vec()
+            } else {
+                println!("nothing to commit, working tree clean");
+                return Ok(None);
+            }
         },
         _ => {
             let content = format!("{}\n{}\n{}\n\n{}\n", 
@@ -450,7 +489,7 @@ fn cat_commit_tree(commit_hash: &str) -> std::io::Result<String> {
     current_path.push(".git/objects");
     current_path.push(dir);
     current_path.push(file);
-    let object_path = current_path.clone();
+    let object_path = current_path;
 
     // open  object and load it in binary
     let mut file = File::open(object_path)?;
@@ -465,13 +504,63 @@ fn cat_commit_tree(commit_hash: &str) -> std::io::Result<String> {
     // separate header and content with null bytes
     let mut contents = object_content.splitn(2, |&x| x == b'\0');
 
+    let _header = contents.next().unwrap();
+
     // retrieves  second word from  first line, splitting it with space, and returns that string
     let tree = contents.next().and_then(|c| {
         c.split(|&x| x == b'\n')
-            .filter(|&x| x.is_empty())
+            .filter(|&x| !x.is_empty())
             .map(|x| String::from_utf8_lossy(x).to_string())
             .find_map(|x| x.split_whitespace().nth(1).map(|x| x.to_string()))
     });
 
     Ok(tree.unwrap())
+}
+
+fn update_ref(commit_hash: &str) -> std::io::Result<()> {
+    let mut path = env::current_dir()?;
+    path.push(PathBuf::from(".git/HEAD"));
+    let mut file_head = File::open(path)?;
+    let mut reference = String::new();
+    file_head.read_to_string(&mut reference)?;
+
+    let prefix_path = reference.split(" ").collect::<Vec<&str>>();
+
+    // if HEAD contains a branch name, the hash value of the branch content will be the hash value that HEAD points to.
+    if prefix_path[1].contains("/") {
+        // branch path is ".git/refs/heads/<branch-name>"
+        let mut branch_path = env::current_dir()?;
+        branch_path.push(PathBuf::from(".git"));
+        // Replace because it contains line breaks
+        branch_path.push(PathBuf::from(prefix_path[1].replace("\n", "")));
+        // println!("{:?}", prefix_path[1]);
+
+        let mut file_branch = File::create(branch_path)?;
+        file_branch.write_all(commit_hash.as_bytes())?;
+        file_branch.flush()?;
+    }
+    
+    // write directly to  HEAD where  hash value was stored
+    let head_content = format!("refs: {}", commit_hash);
+    file_head.write_all(&head_content.as_bytes())?;
+    file_head.flush()?;
+
+    Ok(())
+}
+
+fn add(file_path: &str) -> std::io::Result<()> {
+    write_blob(file_path)?;
+    update_index(file_path)?;
+    Ok(())
+}
+
+fn commit(message: &str) -> std::io::Result<()> {
+    let tree_hash = write_tree()?;
+
+    match commit_tree(&tree_hash, message)? {
+        Some(c) => update_ref(&c)?,
+        _ => println!("Nothing to commit, working tree clean")
+    }
+
+    Ok(())
 }
